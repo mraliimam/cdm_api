@@ -23,8 +23,10 @@ Stage floors:              L4 → 3.0 min  |  L3 → 1.0 min  |  other → 1.0 m
 import datetime
 import statistics
 from typing import Optional
-from src.extensions import db
-from src.models.cdm import CdmAllocation, CdmEffortBaseline
+from extensions import db
+from models.cdm import CdmAllocation, CdmEffortBaseline
+
+
 
 
 MIN_SAMPLES = 3

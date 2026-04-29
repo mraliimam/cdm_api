@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import json
 
-from src.services.audio_difficulty import compute_audio_difficulty
+from services.audio_difficulty import compute_audio_difficulty
 
 
 @dataclass

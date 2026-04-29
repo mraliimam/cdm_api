@@ -27,22 +27,285 @@ For each allocation we write three rows in the same transaction:
 """
 
 import datetime
+import json
 import logging
+import os
+import re
+import subprocess
+import tempfile
+from typing import Tuple
+
+import boto3
+import botocore
 import pandas as pd
-from sqlalchemy import or_
+from pydub import AudioSegment
+from sqlalchemy import or_, text
 
-from src import constants
-from src.extensions import db
-from src.models.cc_audio import CCAudio
-from src.models.users import AAIAPUSERS
-from src.models.workfile import AAIAPWORKFILE
-from src.models.cdm import CdmAllocation
-from src.models.allocation_decision import CdmAllocationDecision
-from src.models.evaluator_performance import CdmEvaluatorPerformance
-from src.services.on_demand_allocator import AllocationConfig, OnDemandAllocator
-from src.services.cdm_workfile_service import provision_l4_workfile
-
+from constants import classify_duration
+import constants
+from extensions import db
+from models.aa_record_model import AARecord
+from models.allocation_decision import CdmAllocationDecision
+from models.cc_audio import CCAudio
+from models.evaluator_performance import CdmEvaluatorPerformance
+from models.users import AAIAPUSERS
+from models.workfile import AAIAPWORKFILE
+from models.cdm import CdmAllocation, _classify_duration
+from services.on_demand_allocator import AllocationConfig, OnDemandAllocator
+from services.cdm_workfile_service import (
+    provision_l4_workfile,
+    provision_l3_workfile_from_aa_record,
+)
+from services.l3_difficulty import compute_for_aa_record
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# L3 audio provisioning — direct replication of cdm_api/L3_job.py
+#
+# Mirrors:
+#   • upload_if_not_exists(s3, bucket, local_path, s3_key)
+#   • is_valid_audio(file_path)
+#   • GetSplittedAudio(source_path, start, end)
+#   • process_splitting_auto_segment(session, aa_record_id)
+#   • the main `for row in df.iterrows()` loop that uploads the sliced
+#     WAV + JSON stubs to the evaluator's ToDo folder and inserts a new
+#     AA_IAP_WORKFILE row (STAGE='L3').
+#   • the aa_workfile_master insert that links the parent AA_RECORD to
+#     the newly created L3 review workfile.
+#
+# The helpers below are intentionally self-contained — nothing is
+# imported from cdm_workfile_service. The flow is invoked inline from
+# `allocate_on_demand` for stage='L3'.
+# ---------------------------------------------------------------------------
+
+_HMS_R2_BUCKET = os.environ.get('HMS_R2_BUCKET', 'rawaudio')
+_R2_BUCKET     = os.environ.get('R2_BUCKET',     'dev-iap-data-operational')
+
+
+def _s3_client():
+    """Boto3 R2 client — same single-client pattern used in L3_job.py."""
+    return boto3.client(
+        's3',
+        endpoint_url          = os.environ.get('R2_ENDPOINT'),
+        aws_access_key_id     = os.environ.get('R2_ACCESS_KEY_ID'),
+        aws_secret_access_key = os.environ.get('R2_SECRET_ACCESS_KEY'),
+    )
+
+
+def _is_valid_audio(file_path: str) -> bool:
+    """Replica of `is_valid_audio` used by L3_job.py."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type", "-of",
+             "default=noprint_wrappers=1:nokey=1", file_path],
+            capture_output=True, text=True,
+        )
+        return result.returncode == 0 and "audio" in result.stdout
+    except Exception as exc:
+        logger.error("Audio validation error: %s", exc)
+        return False
+
+
+def _is_missing_object_error(exc: botocore.exceptions.ClientError) -> bool:
+    """Return True for the different missing-object codes R2/S3 may emit."""
+    error = exc.response.get('Error', {})
+    code = str(error.get('Code', '')).strip().lower().replace(' ', '')
+    status = exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+    return status == 404 or code in {'404', 'nosuchkey', 'notfound'}
+
+
+def _upload_if_not_exists(s3, bucket: str, local_path: str, s3_key: str) -> bool:
+    """Replica of `upload_if_not_exists` from L3_job.py with R2-safe 404 handling."""
+    try:
+        s3.head_object(Bucket=bucket, Key=s3_key)
+        return False
+    except botocore.exceptions.ClientError as exc:
+        if _is_missing_object_error(exc):
+            s3.upload_file(local_path, bucket, s3_key)
+            return True
+        raise
+
+
+def _get_splitted_audio(source_path: str,
+                         segment_start_time: float,
+                         segment_end_time: float) -> AudioSegment:
+    """
+    Replica of `GetSplittedAudio` used inside `process_splitting_auto_segment`
+    in L3_job.py — returns the pydub AudioSegment slice between the two
+    timestamps (in seconds). Caller exports it to disk.
+    """
+    audio = AudioSegment.from_file(source_path)
+    start_ms = max(0, int(float(segment_start_time) * 1000))
+    end_ms   = min(len(audio), int(float(segment_end_time) * 1000)) or len(audio)
+    if end_ms <= start_ms:
+        raise ValueError(
+            f"Invalid segment range: start={segment_start_time}s "
+            f"end={segment_end_time}s"
+        )
+    return audio[start_ms:end_ms]
+
+
+def _process_splitting_auto_segment(aa_record_id) -> bool:
+    """
+    Direct replica of `process_splitting_auto_segment(session, aa_record_ids)`
+    from L3_job.py.
+
+      • Joins AA_RECORD ↔ AA_IAP_WORKFILE for the given record.
+      • Strips `_partN` and the `.WKFL` extension off the parent
+        WORKFILE_NAME to derive the audio basename.
+      • Downloads the parent's converted WAV from HMS R2
+        (`data/Dev/RawAudioFiles/ConvertedAudio/wav/<basename>.wav`),
+        slices it to AA_RECORD's SEGMENT_START_TIME / SEGMENT_END_TIME,
+        and uploads to HMS R2 at `data/Dev/AA_RECORD/L3_<rec.ID>.wav`
+        only when the destination key is missing.
+
+    Returns True when the AA_RECORD slice exists and validates in HMS R2;
+    returns False when the source/slice is missing or invalid. Per-row
+    exceptions are logged and swallowed (same try/except semantics as
+    L3_job.py) so a single bad record cannot abort the surrounding
+    allocation loop.
+    """
+    s3 = _s3_client()
+
+    query = text("""
+        SELECT A.ID, B.WORKFILE_NAME, A.USER_ID, A.SEGMENT_START_TIME,
+               A.SEGMENT_END_TIME, B.AUDIO_KEY
+        FROM AA_RECORD A
+        INNER JOIN AA_IAP_WORKFILE B ON A.WORKFILE_ID = B.ID
+        WHERE A.ID = :aa_record_id
+    """)
+    rows = db.session.execute(query, {'aa_record_id': aa_record_id}).mappings().all()
+    if not rows:
+        logger.warning(
+            "_process_splitting_auto_segment: no AA_RECORD/workfile row found for %s",
+            aa_record_id,
+        )
+        return False
+
+    for row in rows:
+        tmp_source_path = None
+        tmp_dest_path = None
+        try:
+            audio_key_as_workfile_id = re.sub(
+                r'_part\d+', '', (row['WORKFILE_NAME'] or '').split('.')[0]
+            )
+            if not audio_key_as_workfile_id:
+                continue
+
+            segment_start_time = float(row['SEGMENT_START_TIME']) if row['SEGMENT_START_TIME'] else 0.0
+            segment_end_time   = float(row['SEGMENT_END_TIME'])   if row['SEGMENT_END_TIME']   else 0.0
+            record_id          = row['ID']
+
+            source_key = f"data/Dev/RawAudioFiles/ConvertedAudio/wav/{audio_key_as_workfile_id}.wav"
+            dest_key   = f"data/Dev/AA_RECORD/L3_{record_id}.wav"
+            logger.info("audio_key_as_workfile_id %s", audio_key_as_workfile_id)
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_source:
+                s3.download_file(_HMS_R2_BUCKET, source_key, tmp_source.name)
+                tmp_source_path = tmp_source.name
+
+            file_to_export = _get_splitted_audio(
+                tmp_source_path, segment_start_time, segment_end_time
+            )
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_dest:
+                file_to_export.export(tmp_dest.name, format="wav")
+                tmp_dest_path = tmp_dest.name
+                uploaded = _upload_if_not_exists(
+                    s3, _HMS_R2_BUCKET, tmp_dest_path, dest_key
+                )
+                if uploaded:
+                    logger.info("file uploaded to R2: %s", dest_key)
+                else:
+                    logger.info("file already present in R2: %s", dest_key)
+
+            # Best-effort SPLIT_L4_STATUS bookkeeping (mirrors L3_job.py).
+            # Wrapped because the column may not exist on every deployment.
+            try:
+                db.session.execute(
+                    text("UPDATE AA_RECORD SET SPLIT_L4_STATUS = 'Running' WHERE ID = :record_id"),
+                    {"record_id": record_id},
+                )
+            except Exception:
+                logger.debug(
+                    "SPLIT_L4_STATUS update skipped for AA_RECORD %s",
+                    record_id, exc_info=True,
+                )
+
+            if not _is_valid_audio(tmp_dest_path):
+                logger.warning("Invalid audio: %s", dest_key)
+                return False
+
+            for path in (tmp_source_path, tmp_dest_path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return True
+
+        except Exception as exc:
+            logger.warning(
+                "_process_splitting_auto_segment: unable to process record %s: %s",
+                row.get('ID'), exc,
+            )
+            for path in (tmp_source_path, tmp_dest_path):
+                if not path:
+                    continue
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return False
+
+    return False
+
+
+
+def _insert_aa_workfile_master(parent_aa_record_id, review_workfile_id) -> None:
+    """
+    Mirror the `aa_workfile_master` write from L3_job.py:
+
+        INSERT INTO aa_workfile_master
+            (PARENT_AA_RECORD_ID, REVIEW_WORKFILE_ID)
+        VALUES (:PARENT_AA_RECORD_ID, :REVIEW_WORKFILE_ID)
+
+    In L3_job.py, REVIEW_WORKFILE_ID is estimated with MAX(AA_IAP_WORKFILE.ID)+1
+    before the raw AA_IAP_WORKFILE insert. Here we already have the flushed ORM
+    ID, so we write the actual created workfile ID.
+    """
+    db.session.execute(
+        text("""
+            INSERT INTO aa_workfile_master (PARENT_AA_RECORD_ID, REVIEW_WORKFILE_ID)
+            VALUES (:PARENT_AA_RECORD_ID, :REVIEW_WORKFILE_ID)
+        """),
+        {
+            'PARENT_AA_RECORD_ID': str(parent_aa_record_id),
+            'REVIEW_WORKFILE_ID':  str(review_workfile_id),
+        },
+    )
+
+
+def _update_aa_record_relationship_l3_workfile(l4_aa_record_id, l3_workfile_id) -> None:
+    """
+    Mirror the AA_RECORD_RELATIONSHIPS update from L3_job.py:
+
+        UPDATE AA_RECORD_RELATIONSHIPS
+        SET L3_WORKFILE_ID = :l3_workfile_id
+        WHERE L4_AA_RECORD_ID = :l4_aa_record_id
+    """
+    db.session.execute(
+        text("""
+            UPDATE AA_RECORD_RELATIONSHIPS
+            SET L3_WORKFILE_ID = :l3_workfile_id
+            WHERE L4_AA_RECORD_ID = :l4_aa_record_id
+        """),
+        {
+            'l3_workfile_id':  l3_workfile_id,
+            'l4_aa_record_id': l4_aa_record_id,
+        },
+    )
 
 
 # CC_AUDIO.ETL_PROCESSED_FL convention:
@@ -65,6 +328,9 @@ def _mark_audio_processed(cc_audio_id) -> None:
     Stamp CC_AUDIO.ETL_PROCESSED_FL = 'Y' once an audio has been successfully
     routed to an evaluator. Called inside the same transaction as the
     allocation/workfile writes so a rollback also un-marks the row.
+
+    Used by the L4 path only. The L3 path must NOT touch CC_AUDIO — it
+    flips state on AA_RECORD instead via `_mark_aa_record_routed`.
     """
     if not cc_audio_id:
         return
@@ -72,6 +338,73 @@ def _mark_audio_processed(cc_audio_id) -> None:
         {
             CCAudio.ETL_PROCESSED_FL: ETL_PROCESSED_YES,
             CCAudio.ETL_ROW_PROCESS_DTS: datetime.datetime.utcnow(),
+        },
+        synchronize_session=False,
+    )
+
+
+# AA_RECORD.L3_PROCESSED_FL convention:
+#   'N'          → not yet routed to an L3 user, eligible for allocation
+#   'Y'          → already routed by CDM at least once; ineligible
+AA_RECORD_L3_PROCESSED_YES = 'Y'
+AA_RECORD_L3_PROCESSED_NO  = 'N'
+AA_RECORD_L3_ROUTED        = 'ROUTED'
+AA_RECORD_L3_NOT_FOUND     = 'NOT_FOUND'
+AA_RECORD_L3_INVALID_AUDIO = 'INVALID_AUDIO'
+
+
+def _aa_record_eligible_filter():
+    """SQLAlchemy filter that keeps only AA_RECORD rows with L3_PROCESSED_FL='N'."""
+    return db.func.upper(db.func.trim(AARecord.L3_PROCESSED_FL)) == AA_RECORD_L3_PROCESSED_NO
+
+
+def _is_aa_record_l3_pending(aa_record: AARecord) -> bool:
+    """Return True only when the current AA_RECORD flag is explicitly 'N'."""
+    flag = getattr(aa_record, 'L3_PROCESSED_FL', None)
+    return str(flag).strip().upper() == AA_RECORD_L3_PROCESSED_NO
+
+
+def _mark_aa_record_routed(aa_record_id) -> None:
+    """
+    Stamp AA_RECORD.L3_PROCESSED_FL = 'Y' once a record has been assigned
+    to an L3 user.
+
+    CDM_L3_STATUS / CDM_L3_ROUTED_DTS are also retained as internal CDM
+    routing metadata for existing admin/debug views, but eligibility is driven
+    strictly by L3_PROCESSED_FL.
+
+    Called inside the same transaction as the allocation / workfile writes
+    so a rollback also un-marks the row. This is the L3 counterpart to
+    `_mark_audio_processed` — the L3 flow never updates CC_AUDIO.
+    """
+    if not aa_record_id:
+        return
+    AARecord.query.filter_by(ID=aa_record_id).update(
+        {
+            AARecord.L3_PROCESSED_FL:    AA_RECORD_L3_PROCESSED_YES,
+            AARecord.CDM_L3_STATUS:     AA_RECORD_L3_ROUTED,
+            AARecord.CDM_L3_ROUTED_DTS: datetime.datetime.utcnow(),
+        },
+        synchronize_session=False,
+    )
+
+
+def _mark_aa_record_l3_failed(aa_record_id, status: str = AA_RECORD_L3_NOT_FOUND) -> None:
+    """
+    Mark an AA_RECORD as no longer eligible for L3 allocation when its audio
+    cannot be produced or validated.
+
+    L3 eligibility is driven by L3_PROCESSED_FL='N', so setting it to 'Y'
+    prevents the same broken record from being selected on every future
+    request. CDM_L3_STATUS captures why it was skipped.
+    """
+    if not aa_record_id:
+        return
+    AARecord.query.filter_by(ID=aa_record_id).update(
+        {
+            AARecord.L3_PROCESSED_FL:    AA_RECORD_L3_PROCESSED_YES,
+            AARecord.CDM_L3_STATUS:     status,
+            AARecord.CDM_L3_ROUTED_DTS: datetime.datetime.utcnow(),
         },
         synchronize_session=False,
     )
@@ -138,7 +471,7 @@ def _audio_to_response_extras(cc_audio: CCAudio, iap_workfile=None) -> dict:
         '_test_static_id':     iap_workfile.TEST_STATIC_ID if iap_workfile else None,
         '_user_stage':         iap_workfile.USER_STAGE if iap_workfile else None,
         '_duration_label':     constants.classify_duration(cc_audio.DURATION),
-        '_audio_data':         cc_audio.to_audio_data_dict(),
+        '_audio_data':         None,   # populated lazily for selected items only
     }
 
 
@@ -165,7 +498,7 @@ def _workfile_to_extras(wf: AAIAPWORKFILE, cc_audio: CCAudio) -> dict:
         '_test_static_id':     wf.TEST_STATIC_ID,
         '_user_stage':         wf.USER_STAGE,
         '_duration_label':     constants.classify_duration(cc_audio.DURATION),
-        '_audio_data':         cc_audio.to_audio_data_dict(),
+        '_audio_data':         cc_audio.to_json(),
     }
 
 
@@ -239,77 +572,257 @@ def _build_recordings_df_l4(exclude_audio_ids: list = None):
     return pd.DataFrame(rows), extras_map
 
 
+# ---------------------------------------------------------------------------
+# L3 AA_RECORD helpers
+# ---------------------------------------------------------------------------
+
+def _aa_record_primary_user_id(rec: AARecord) -> int:
+    """
+    Pick the recitation-owner user_id from an AA_RECORD row.
+
+    Priority mirrors CC_AUDIO.primary_user_id: student → unknown_user → teacher
+    → pro_reciter → 0. Returns 0 (rather than None) so the allocator's
+    user_quality_score lookup never receives NaN.
+    """
+    return (
+        rec.STUDENT_ID_1
+        or rec.UNKNOWN_USER_ID_1
+        or rec.TEACHER_ID
+        or rec.PRO_RECITER_ID
+        or 0
+    )
+
+
+def _aa_record_to_recording_dict(rec: AARecord, parent_audio: CCAudio = None) -> dict:
+    """
+    Build the allocator-facing recording row from an AA_RECORD.
+    Used for L3 allocations where AA_RECORD is the primary candidate source.
+    sample_id is AA_RECORD.ID.
+    """
+    diff = compute_for_aa_record(rec, parent_audio=parent_audio)
+
+    # Segment length (seconds) — fall back to parent CC_AUDIO duration so
+    # the allocator never sees a zero/None recording_time.
+    segment_secs = diff.get('segment_length_seconds')
+    if not segment_secs and parent_audio is not None:
+        try:
+            segment_secs = float(parent_audio.DURATION) if parent_audio.DURATION else None
+        except (TypeError, ValueError):
+            segment_secs = None
+    if not segment_secs:
+        segment_secs = 60.0   # 1-minute neutral default
+
+    # Audio-quality severities pulled directly from AA_RECORD's column
+    # spellings, falling back to the parent CC_AUDIO when a column is
+    # NULL on AA_RECORD itself.
+    def _aa(col, parent_col=None):
+        val = getattr(rec, col, None)
+        if (val is None or val == '') and parent_audio is not None and parent_col:
+            val = getattr(parent_audio, parent_col, None)
+        return val
+
+    return {
+        'sample_id':                    rec.ID,
+        'user_id':                      _aa_record_primary_user_id(rec),
+        'base_effort_minute':           diff['base_effort_minute'],
+        'recording_time':               segment_secs,
+        'difficulty_score':             diff['difficulty_score'],
+        'difficulty_level':             diff['difficulty_level'],
+        'audio_length':                 _aa('RECORD_LENGTH', 'AUDIO_LENGTH'),
+        'mistake_level':                constants.score_value(
+            'MISTAKE_LEVEL',
+            getattr(parent_audio, 'MISTAKE_LEVEL', None) if parent_audio else None),
+        'background_noise_level':       constants.score_value(
+            'BACKGROUND_NOISE_LEVEL',
+            _aa('RECORD_BACKGROUND_NOISE', 'BACKGROUND_NOISE_LEVEL')),
+        'repeats_pauses_stutter_level': constants.score_value(
+            'REPEATS_PAUSES_STUTTER_LEVEL',
+            _aa('REPEATS_PAUSE_STUTTER_LEVEL', 'REPEATS_PAUSES_STUTTER_LEVEL')),
+        'audio_issues_level':           constants.score_value(
+            'AUDIO_ISSUES_LEVEL',
+            _aa('RECORD_AUDIO_ISSUES_LEVEL', 'AUDIO_ISSUES_LEVEL')),
+        'recitation_speed':             constants.score_value(
+            'RECITATION_SPEED',
+            _aa('RECITER_PACE', 'RECITATION_SPEED')),
+        'voice_pitch':                  constants.score_value(
+            'VOICE_PITCH',
+            _aa('RECITER_VOICE_PITCH', 'VOICE_PITCH')),
+        'voice_clarity':                constants.score_value(
+            'VOICE_CLARITY',
+            _aa('RECITER_VOICE_CLARITY', 'VOICE_CLARITY')),
+        'audio_source':                 constants.score_value(
+            'AUDIO_SOURCE',
+            getattr(parent_audio, 'AUDIO_SOURCE', None) if parent_audio else None),
+    }
+
+
+def _aa_record_to_response_extras(rec: AARecord, parent_audio: CCAudio = None) -> dict:
+    """
+    Build the extras dict for an L3 candidate sourced from AA_RECORD.
+
+    The eventual AA_IAP_WORKFILE row will be created by
+    `provision_l3_workfile_from_aa_record(...)` once allocation succeeds,
+    so this dict carries the *future* file paths that the provisioning
+    helper will assemble. Concrete WORKFILE_NAME / *_FILEPATH values are
+    overwritten by `_workfile_to_extras_l3` after provisioning.
+    """
+    return {
+        '_iap_workfile_id':    None,
+        '_aa_record_id':       rec.ID,
+        '_workfile_name':      rec.RECORD_NAME,
+        '_audio_filepath':     rec.RECORD_FILEPATH,
+        '_filesave_filepath':  None,
+        '_modelpred_filepath': None,
+        '_stage':              'L3',
+        '_cc_audio_id':        (parent_audio.ID if parent_audio else
+                                rec.WORKFILE_ID),  # AA_IAP_WORKFILE.ID of parent
+        '_last_moved_dt':      (rec.ROW_PROC_DTS.isoformat()
+                                if rec.ROW_PROC_DTS else None),
+        '_test_static_id':     None,
+        '_user_stage':         rec.STAGE,
+        '_duration_label':     constants.classify_duration(
+            getattr(parent_audio, 'DURATION', None) if parent_audio else None),
+        '_audio_data':         None,
+    }
+
+
+def _workfile_to_extras_l3(wf: AAIAPWORKFILE,
+                            rec: AARecord,
+                            parent_audio: CCAudio = None) -> dict:
+    """
+    Refresh the extras dict from a freshly provisioned L3 AAIAPWORKFILE so
+    the API response carries the real paths/IDs (mirrors `_workfile_to_extras`
+    for L4).
+    """
+    return {
+        '_iap_workfile_id':    wf.ID,
+        '_aa_record_id':       rec.ID,
+        '_user_id':            wf.ASSIGNED_USER_ID,
+        '_workfile_name':      wf.WORKFILE_NAME,
+        '_audio_filepath':     wf.AUDIO_FILEPATH,
+        '_filesave_filepath':  wf.FILESAVE_FILEPATH,
+        '_modelpred_filepath': wf.MODELPRED_FILEPATH,
+        '_stage':              'L3',
+        '_cc_audio_id':        wf.CC_AUDIO_ID,
+        '_last_moved_dt':      str(wf.LAST_MOVED_DT) if wf.LAST_MOVED_DT else None,
+        '_test_static_id':     wf.TEST_STATIC_ID,
+        '_user_stage':         wf.USER_STAGE,
+        '_duration_label':     constants.classify_duration(
+            getattr(parent_audio, 'DURATION', None) if parent_audio else None),
+        '_audio_data':         rec.to_json() if hasattr(rec, 'to_json') else None,
+    }
+
+
+def _build_recordings_df_l3_aa_record(exclude_record_ids: list = None):
+    """
+    L3 candidate pool — sourced directly from AA_RECORD.
+
+    An AA_RECORD row is excluded when:
+      • ETL_Active_FL != 'Y' (defensive — keeps disabled segments out), OR
+      • L3_PROCESSED_FL != 'N' (only rows explicitly pending L3 pickup are
+        eligible), OR
+      • An L3 AA_IAP_WORKFILE has already been created for the record
+        (row already routed to an L3 user previously), OR
+      • PR_TR_1 / FE_TRANSCRIPTION are both empty (nothing for L3 to verify).
+
+    Returns (DataFrame, extras_map) keyed by AA_RECORD.ID.
+
+    NOTE: when `compute_for_aa_record` runs we want the parent CC_AUDIO so
+    MISTAKE_LEVEL / AUDIO_SOURCE can fall back to the source recording's
+    values. We bulk-load it via WORKFILE_ID → AA_IAP_WORKFILE → CC_AUDIO_ID.
+    """
+    # Records already routed to an L3 user via a previous allocation/workfile.
+    routed_record_ids = (
+        db.session.query(AAIAPWORKFILE.AA_RECORD_ID)
+        .filter(
+            AAIAPWORKFILE.STAGE == 'L3',
+            AAIAPWORKFILE.AA_RECORD_ID.isnot(None),
+        )
+    )
+
+    query = (
+        AARecord.query
+        .filter(
+            or_(AARecord.ETL_Active_FL == 'Y',
+                AARecord.ETL_Active_FL.is_(None)),
+            _aa_record_eligible_filter(),
+            ~AARecord.ID.cast(db.String).in_(routed_record_ids),
+        )
+    )
+    if exclude_record_ids:
+        query = query.filter(~AARecord.ID.in_(exclude_record_ids))
+
+    records = query.all()
+    if not records:
+        return pd.DataFrame(), {}
+
+    # Bulk-load parent AA_IAP_WORKFILE → CC_AUDIO so the per-record loop
+    # below doesn't issue N+1 queries.
+    parent_workfile_ids = [int(r.WORKFILE_ID) for r in records
+                           if r.WORKFILE_ID and str(r.WORKFILE_ID).isdigit()]
+    parent_workfile_map: dict = {}
+    if parent_workfile_ids:
+        for wf in AAIAPWORKFILE.query.filter(
+            AAIAPWORKFILE.ID.in_(parent_workfile_ids)
+        ).all():
+            parent_workfile_map[wf.ID] = wf
+
+    parent_audio_ids = [
+        int(wf.CC_AUDIO_ID) for wf in parent_workfile_map.values()
+        if wf.CC_AUDIO_ID and str(wf.CC_AUDIO_ID).isdigit()
+    ]
+    parent_audio_map: dict = {}
+    if parent_audio_ids:
+        for a in CCAudio.query.filter(CCAudio.ID.in_(parent_audio_ids)).all():
+            parent_audio_map[a.ID] = a
+
+    rows: list = []
+    extras_map: dict = {}
+    for rec in records:
+        # Skip records with no L3-meaningful payload.
+        if not (rec.PR_TR_1 or rec.FE_TRANSCRIPTION):
+            continue
+
+        parent_wf = parent_workfile_map.get(
+            int(rec.WORKFILE_ID)) if rec.WORKFILE_ID and str(rec.WORKFILE_ID).isdigit() else None
+        parent_audio = (parent_audio_map.get(int(parent_wf.CC_AUDIO_ID))
+                        if parent_wf and parent_wf.CC_AUDIO_ID
+                        and str(parent_wf.CC_AUDIO_ID).isdigit()
+                        else None)
+
+        rows.append(_aa_record_to_recording_dict(rec, parent_audio))
+        extras_map[rec.ID] = _aa_record_to_response_extras(rec, parent_audio)
+        # Stash the live ORM rows so the allocator can hand them straight
+        # to provision_l3_workfile_from_aa_record without a second SELECT.
+        extras_map[rec.ID]['_aa_record_obj']    = rec
+        extras_map[rec.ID]['_parent_audio_obj'] = parent_audio
+
+    return pd.DataFrame(rows), extras_map
+
+
 def _build_recordings_df(stage: str, exclude_ids: list = None):
     """
     Return (recordings_df, extras_map) for the given stage.
 
-    L3  — candidates are sourced from AA_IAP_WORKFILE (existing behaviour).
+    L3  — candidates are sourced from AA_RECORD; the assignment is created
+          fresh by `provision_l3_workfile_from_aa_record` after allocation.
     L4  — candidates are sourced from CC_AUDIO; assignment is checked via
           AA_IAP_WORKFILE.ASSIGNED_USER_ID and CC_CDM_ALLOCATION.
 
     extras_map keys are always the sample_id used by the allocator:
-      L3 → AAIAPWORKFILE.ID
+      L3 → AARecord.ID
       L4 → CCAudio.ID
     """
     if stage == 'L4':
         return _build_recordings_df_l4(exclude_audio_ids=exclude_ids)
 
-    # ---- L3: source from AA_IAP_WORKFILE ---------------
-    already_assigned = (
-        db.session.query(CdmAllocation.IAP_WORKFILE_ID)
-        .filter(
-            CdmAllocation.STATUS.in_(['pending', 'completed']),
-            CdmAllocation.STAGE == stage,
-        )
-        .subquery()
-    )
+    if stage == 'L3':
+        return _build_recordings_df_l3_aa_record(exclude_record_ids=exclude_ids)
 
-    query = (
-        AAIAPWORKFILE.query
-        .filter(
-            AAIAPWORKFILE.STAGE == stage,
-            AAIAPWORKFILE.ASSIGNED_USER_ID.is_(None),
-            ~AAIAPWORKFILE.ID.in_(already_assigned),
-        )
-    )
-    if exclude_ids:
-        query = query.filter(~AAIAPWORKFILE.ID.in_(exclude_ids))
-
-    workfiles = query.all()
-    if not workfiles:
-        return pd.DataFrame(), {}
-
-    cc_audio_ids = [
-        int(w.CC_AUDIO_ID) for w in workfiles
-        if w.CC_AUDIO_ID is not None
-    ]
-    audio_map = {}
-    if cc_audio_ids:
-        # Only pull in CC_AUDIO rows still eligible for CDM routing
-        # (ETL_PROCESSED_FL is NULL or 'N'). Workfiles whose audio is
-        # already 'Y' will be dropped below.
-        audio_rows = (
-            CCAudio.query
-            .filter(CCAudio.ID.in_(cc_audio_ids), _audio_eligible_filter())
-            .all()
-        )
-        audio_map = {a.ID: a for a in audio_rows}
-
-    rows       = []
-    extras_map = {}
-    for wf in workfiles:
-        cc_audio = audio_map.get(int(wf.CC_AUDIO_ID)) if wf.CC_AUDIO_ID else None
-        # Skip workfiles whose audio has already been processed by CDM.
-        # `cc_audio is None` here means either the workfile has no audio
-        # or the audio was filtered out as ineligible.
-        if wf.CC_AUDIO_ID is not None and cc_audio is None:
-            continue
-        rows.append(wf.to_recording_dict(cc_audio))
-        extras = wf.to_response_extras(cc_audio)
-        extras['_iap_workfile_id'] = wf.ID
-        extras_map[wf.ID] = extras
-
-    return pd.DataFrame(rows), extras_map
+    # Fallback: empty pool for any unknown stage so the allocator
+    # downstream simply returns "no candidates" rather than blowing up.
+    logger.warning("_build_recordings_df: unknown stage %r — returning empty pool", stage)
+    return pd.DataFrame(), {}
 
 
 def _build_evaluator_df(evaluator_ids: list) -> pd.DataFrame:
@@ -391,7 +904,7 @@ def _run_allocator(
     evaluator_ids: list,
     stage: str,
     exclude_ids: list = None,
-) -> tuple:
+) -> Tuple["OnDemandAllocator", pd.DataFrame, dict]:
     """
     Initialise and fit OnDemandAllocator with DB-backed DataFrames.
     Returns (allocator, recordings_df, extras_map).
@@ -513,15 +1026,36 @@ def _write_allocation_row(
     cdm_mode: str,
     result,
     bias_factor: float,
+    aa_record_id=None,
 ) -> int:
-    """Insert one CC_CDM_ALLOCATION row (and return its primary-key ID)."""
+    """
+    Insert one CC_CDM_ALLOCATION row (and return its primary-key ID).
+
+    Predicted metrics + per-parameter rationale captured here:
+      • PREDICTED_ACCURACY     ← result.predicted_metrics['accuracy']
+      • PREDICTED_SATISFACTION ← result.predicted_metrics['satisfaction']
+      • PREDICTED_EFFORT_MINS  ← result.predicted_metrics['effort_minutes']
+      • RATIONALE              ← result.rationale (truncated to 2000 chars)
+
+    Stage references:
+      • STAGE = 'L4' → CCAUDIO_ID is set, AA_RECORD_ID is NULL
+      • STAGE = 'L3' → AA_RECORD_ID is set; CCAUDIO_ID stays NULL because
+        the L3 flow must not write to CC_AUDIO. The parent CC_AUDIO
+        remains traceable via AA_IAP_WORKFILE.CC_AUDIO_ID on the linked
+        workfile row.
+    """
     rec       = result.selected_recording
     predicted = rec.predicted_metrics or {}
+
+    # L3 must not couple to CC_AUDIO at the allocation level.
+    ccaudio_fk  = None if stage == 'L3' else (int(cc_audio_id) if cc_audio_id else None)
+    aa_record_fk = int(aa_record_id) if aa_record_id else None
 
     row = CdmAllocation(
         EVALUATOR_ID           = evaluator_id,
         IAP_WORKFILE_ID        = workfile_id,
-        CCAUDIO_ID             = int(cc_audio_id) if cc_audio_id else None,
+        CCAUDIO_ID             = ccaudio_fk,
+        AA_RECORD_ID           = aa_record_fk,
         USER_ID                = rec.user_id or None,
         CDM_MODE               = cdm_mode,
         STAGE                  = stage,
@@ -597,15 +1131,19 @@ def allocate_on_demand(
     if recordings_df.empty:
         return []
 
-    evaluator_username = None
-    if stage == 'L4':
-        ev = AAIAPUSERS.query.get(evaluator_id)
-        evaluator_username = ev.USERNAME if ev else str(evaluator_id)
+    # Both L3 and L4 provisioning hit R2 with the evaluator's USERNAME, so
+    # resolve it up front for either stage.
+    ev = AAIAPUSERS.query.get(evaluator_id)
+    evaluator_username = ev.USERNAME if ev else str(evaluator_id)
 
     assignments = []
     excluded    = []
 
-    for _ in range(n_files):
+    # Keep trying additional candidates when one cannot be provisioned
+    # (for example, L3 source audio missing in R2). `excluded` prevents
+    # retrying the same candidate in this request, and the L3 failure marker
+    # below prevents retrying broken records in future requests.
+    while len(assignments) < n_files and len(excluded) < len(recordings_df):
         result = allocator.allocate_recording(
             evaluator_id, exclude_recording_ids=excluded
         )
@@ -651,21 +1189,171 @@ def allocate_on_demand(
             # All chunks for this CC_AUDIO have been allocated → flip the
             # ETL flag once so subsequent allocator runs skip it.
             _mark_audio_processed(cc_audio_id)
-        else:
-            iap_workfile_id = extras.get('_iap_workfile_id')
+
+        elif stage == 'L3':
+            aa_record    = extras.get('_aa_record_obj')
+            parent_audio = extras.get('_parent_audio_obj')
+            if aa_record is None:
+                # Cold-cache fallback: re-fetch by sample_id (= AA_RECORD.ID)
+                aa_record = AARecord.query.get(sample_id)
+            if aa_record is None:
+                logger.warning(
+                    "allocate_on_demand: AA_RECORD %s not found, skipping", sample_id
+                )
+                continue
+            db.session.refresh(aa_record)
+            if not _is_aa_record_l3_pending(aa_record):
+                logger.info(
+                    "allocate_on_demand: AA_RECORD %s skipped because "
+                    "L3_PROCESSED_FL=%r",
+                    aa_record.ID, aa_record.L3_PROCESSED_FL,
+                )
+                continue
+
+            # ----------------------------------------------------------- #
+            # Direct inline replication of L3_job.py for this AA_RECORD.  #
+            # No imports from cdm_workfile_service — every helper used    #
+            # here is the L3_job.py-style one defined above in this file.#
+            # ----------------------------------------------------------- #
+            s3 = _s3_client()
+
+            # 1. process_splitting_auto_segment(session, row['ID'])
+            try:
+                segment_ready = _process_splitting_auto_segment(aa_record.ID)
+            except Exception as exc:
+                logger.error(
+                    "allocate_on_demand: L3 segment splitting failed for "
+                    "AA_RECORD %s: %s", aa_record.ID, exc, exc_info=True,
+                )
+                continue
+            if not segment_ready:
+                logger.info(
+                    "allocate_on_demand: L3 segment not ready for AA_RECORD %s; "
+                    "marking NOT_FOUND and trying next candidate",
+                    aa_record.ID,
+                )
+                _mark_aa_record_l3_failed(aa_record.ID, AA_RECORD_L3_NOT_FOUND)
+                continue
+
+            # 2. object_key + R2 existence check
+            object_key = f"data/Dev/AA_RECORD/L3_{aa_record.ID}.wav"
+            try:
+                s3.head_object(Bucket=_HMS_R2_BUCKET, Key=object_key)
+            except botocore.exceptions.ClientError as exc:
+                if not _is_missing_object_error(exc):
+                    raise
+                logger.info("File not found in R2: %s", object_key)
+                _mark_aa_record_l3_failed(aa_record.ID, AA_RECORD_L3_NOT_FOUND)
+                continue
+
+            # 3. Download to temp file and validate
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+                s3.download_file(_HMS_R2_BUCKET, object_key, tmp_file.name)
+                local_path = tmp_file.name
+
+            if not _is_valid_audio(local_path):
+                logger.info("Invalid audio file: %s", object_key)
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                _mark_aa_record_l3_failed(aa_record.ID, AA_RECORD_L3_INVALID_AUDIO)
+                continue
+
+            # 4. filename = basename without extension (L3_<rec.ID>)
+            filename, _ext = os.path.splitext(os.path.basename(object_key))
+            workfile_name  = filename
+
+            # 5. Move to evaluator's ToDo folder + write empty stubs
+            audio_s3_key     = f"data/Dev/ToDo/{evaluator_username}/Audio/{workfile_name}.WKFL"
+            modelpred_s3_key = f"data/Dev/ToDo/{evaluator_username}/ModelPred/{workfile_name}.json"
+            filesave_s3_key  = f"data/Dev/ToDo/{evaluator_username}/FileSave/{workfile_name}.json"
+
+            s3.upload_file(local_path, _R2_BUCKET, audio_s3_key)
+            logger.info("Uploaded file to s3://%s/%s", _R2_BUCKET, audio_s3_key)
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+
+            # ModelPred stub — { "data": [] } per L3_job.py.
+            model_pred_path = f"/tmp/{workfile_name}_modelpred.json"
+            with open(model_pred_path, "w", encoding="utf-8") as outfile:
+                json.dump({"data": []}, outfile)
+            s3.upload_file(model_pred_path, _R2_BUCKET, modelpred_s3_key)
+            logger.info(
+                "Uploaded model predictions to s3://%s/%s",
+                _R2_BUCKET, modelpred_s3_key,
+            )
+
+            # FileSave stub — L3_job.py copies a remote FileSaveBase.json
+            # template that does not exist in this repo. We fall back to
+            # the same empty-data shape we use for ModelPred.
+            filesave_path = f"/tmp/{workfile_name}_filesave.json"
+            with open(filesave_path, "w", encoding="utf-8") as outfile:
+                json.dump({"data": []}, outfile)
+            s3.upload_file(filesave_path, _R2_BUCKET, filesave_s3_key)
+            logger.info(
+                "Uploaded FileSave JSON to s3://%s/%s",
+                _R2_BUCKET, filesave_s3_key,
+            )
+
+            # 6. Insert AA_IAP_WORKFILE row (L3_job.py INSERT mirror).
+            now_str = datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S")
+            new_wf = AAIAPWORKFILE(
+                WORKFILE_NAME      = f"{workfile_name}.WKFL",
+                WORKFILE_STATUS    = 'ToDo',
+                ASSIGNED_USER_ID   = evaluator_id,
+                AUDIO_FILEPATH     = audio_s3_key,
+                AUDIO_STATUS       = 'ToDo',
+                AUDIO_KEY          = 'obsolete',
+                FILESAVE_FILEPATH  = filesave_s3_key,
+                FILESAVE_STATUS    = 'ToDo',
+                MODELPRED_FILEPATH = modelpred_s3_key,
+                MODELPRED_STATUS   = 'ToDo',
+                LAST_MOVED_DT      = now_str,
+                LAST_MOVED_BY      = 'ETL',
+                CURR_ROW_FL        = 'Y',
+                STAGE              = 'L3',
+                REVIEW_FL          = 'N',
+                CC_AUDIO_ID        = None,
+                AA_RECORD_ID       = str(aa_record.ID),
+                TEST_STATIC_ID     = None,
+                TO_DO_MOVED_DTS    = now_str,
+            )
+            db.session.add(new_wf)
+            db.session.flush()
+            _update_aa_record_relationship_l3_workfile(sample_id, new_wf.ID)
+            _insert_aa_workfile_master(aa_record.ID, new_wf.ID)
+            logger.info(
+                "allocate_on_demand: created AA_IAP_WORKFILE ID=%s for AA_RECORD %s",
+                new_wf.ID, aa_record.ID,
+            )
+
+            # ----------------------------------------------------------- #
+            # CDM allocation bookkeeping (unchanged — not S3-related).    #
+            # ----------------------------------------------------------- #
+            chunk_extras  = _workfile_to_extras_l3(new_wf, aa_record, parent_audio)
             allocation_id = _write_allocation_row(
-                evaluator_id, iap_workfile_id, cc_audio_id,
+                evaluator_id, new_wf.ID, None,
                 stage, 'on_demand', result, effort_bias_factor,
+                aa_record_id=aa_record.ID,
             )
-            _set_workfile_allocation_id(iap_workfile_id, allocation_id)
-            _assign_workfile(iap_workfile_id, evaluator_id, cc_audio_id=cc_audio_id)
+            _set_workfile_allocation_id(new_wf.ID, allocation_id)
             _write_decision_rows(
-                allocation_id, evaluator_id, cc_audio_id, iap_workfile_id, stage, result,
+                allocation_id, evaluator_id, None, new_wf.ID, stage, result,
             )
-            _mark_audio_processed(cc_audio_id)
-            entry = _serialize_result(result, extras, stage)
+            # L3 must NOT update CC_AUDIO. Routing state lives on AA_RECORD.
+            _mark_aa_record_routed(aa_record.ID)
+
+            entry = _serialize_result(result, chunk_extras, stage)
             entry['allocation_id'] = allocation_id
+            entry['aa_record_id']  = aa_record.ID
             assignments.append(entry)
+
+        else:
+            logger.warning("allocate_on_demand: unsupported stage %r — skipping", stage)
+            continue
 
     db.session.commit()
     return assignments
@@ -688,10 +1376,9 @@ def allocate_scheduled(
     if recordings_df.empty:
         return {'total_assigned': 0, 'by_evaluator': [], 'stage': stage}
 
-    username_by_id: dict = {}
-    if stage == 'L4':
-        users = AAIAPUSERS.query.filter(AAIAPUSERS.ID.in_(evaluator_ids)).all()
-        username_by_id = {u.ID: u.USERNAME or str(u.ID) for u in users}
+    # Both L3 and L4 provisioning need the evaluator's USERNAME for R2.
+    users = AAIAPUSERS.query.filter(AAIAPUSERS.ID.in_(evaluator_ids)).all()
+    username_by_id = {u.ID: u.USERNAME or str(u.ID) for u in users}
 
     total_assigned    = 0
     by_evaluator      = []
@@ -750,21 +1437,55 @@ def allocate_scheduled(
 
                 # All chunks for this CC_AUDIO have been allocated → flag it.
                 _mark_audio_processed(cc_audio_id)
-            else:
-                iap_workfile_id = extras.get('_iap_workfile_id')
+
+            elif stage == 'L3':
+                aa_record    = extras.get('_aa_record_obj')
+                parent_audio = extras.get('_parent_audio_obj')
+                if aa_record is None:
+                    aa_record = AARecord.query.get(sample_id)
+                if aa_record is None:
+                    logger.warning(
+                        "allocate_scheduled: AA_RECORD %s not found, skipping", sample_id
+                    )
+                    continue
+
+                username = username_by_id.get(evaluator_id, str(evaluator_id))
+                try:
+                    new_wf = provision_l3_workfile_from_aa_record(
+                        aa_record, evaluator_id, username,
+                        parent_audio=parent_audio,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "allocate_scheduled: L3 provisioning failed for AA_RECORD %s "
+                        "(evaluator %s): %s",
+                        sample_id, evaluator_id, exc, exc_info=True,
+                    )
+                    continue
+
+                chunk_extras  = _workfile_to_extras_l3(new_wf, aa_record, parent_audio)
                 allocation_id = _write_allocation_row(
-                    evaluator_id, iap_workfile_id, cc_audio_id,
+                    evaluator_id, new_wf.ID, None,
                     stage, 'scheduled', result, effort_bias_factor,
+                    aa_record_id=aa_record.ID,
                 )
-                _set_workfile_allocation_id(iap_workfile_id, allocation_id)
-                _assign_workfile(iap_workfile_id, evaluator_id, cc_audio_id=cc_audio_id)
+                _set_workfile_allocation_id(new_wf.ID, allocation_id)
                 _write_decision_rows(
-                    allocation_id, evaluator_id, cc_audio_id, iap_workfile_id, stage, result,
+                    allocation_id, evaluator_id, None, new_wf.ID, stage, result,
                 )
-                _mark_audio_processed(cc_audio_id)
-                entry = _serialize_result(result, extras, stage)
+                # L3 must NOT update CC_AUDIO. Routing state lives on AA_RECORD.
+                _mark_aa_record_routed(aa_record.ID)
+
+                entry = _serialize_result(result, chunk_extras, stage)
                 entry['allocation_id'] = allocation_id
+                entry['aa_record_id']  = aa_record.ID
                 eval_assignments.append(entry)
+
+            else:
+                logger.warning(
+                    "allocate_scheduled: unsupported stage %r — skipping", stage
+                )
+                continue
 
         db.session.commit()
         total_assigned += len(eval_assignments)

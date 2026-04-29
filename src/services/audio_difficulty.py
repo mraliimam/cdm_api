@@ -37,7 +37,7 @@ metric and the per-parameter contribution into a decision-log table.
 
 from typing import Any, Dict, Optional
 
-from src import constants
+import constants
 
 
 _NOMINAL_LENGTH_SECONDS = 300.0   # used when AUDIO_LENGTH is missing

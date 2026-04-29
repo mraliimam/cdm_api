@@ -21,7 +21,7 @@ the highest-impact parameters without re-deriving anything.
 
 from datetime import datetime
 
-from src.extensions import db
+from extensions import db
 
 
 # Decision categories (kept as plain strings so SQL admin tools can filter easily)

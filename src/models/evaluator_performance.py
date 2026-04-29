@@ -23,7 +23,7 @@ specific pair more, fewer → trust the global evaluator profile more).
 
 from datetime import datetime
 
-from src.extensions import db
+from extensions import db
 
 
 class CdmEvaluatorPerformance(db.Model):
